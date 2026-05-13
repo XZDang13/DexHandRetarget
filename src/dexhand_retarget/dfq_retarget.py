@@ -18,6 +18,7 @@ from .state import SharedState
 COMMAND_TYPE = "dfq_command"
 COMMAND_VERSION = 1
 FINGERS = ("thumb", "index", "middle", "ring", "pinky")
+NON_THUMB_FINGERS = ("index", "middle", "ring", "pinky")
 FINGER_DIRECTION_WEIGHT = 0.35
 FINGER_DISTANCE_WEIGHT = 0.35
 FINGER_BEND_WEIGHT = 3.0
@@ -26,13 +27,17 @@ THUMB_DISTANCE_WEIGHT = 0.2
 THUMB_BEND_WEIGHT = 1.4
 THUMB_LOOKUP_DIRECTION_WEIGHT = 1.8
 THUMB_LOOKUP_DISTANCE_WEIGHT = 0.12
-THUMB_LOOKUP_PITCH_WEIGHT = 0.45
+THUMB_LOOKUP_PITCH_WEIGHT = 2.5
 CTRL_REGULARIZATION_WEIGHT = 0.03
 DEFAULT_MAX_NFEV = 25
 DEFAULT_EMA_ALPHA = 0.45
 VIEWER_DT = 1.0 / 60.0
 THUMB_LOOKUP_YAW_SAMPLES = 31
-THUMB_LOOKUP_PITCH_SAMPLES = 21
+THUMB_LOOKUP_PITCH_SAMPLES = 41
+THUMB_DIRECTION_CALIBRATION = np.diag((1.0, 1.0, -1.0))
+THUMB_BEND_TO_PITCH_SCALE = 0.55
+NON_THUMB_DIRECTION_CALIBRATION = np.diag((-1.0, 1.0, -1.0))
+NON_THUMB_BEND_TO_CTRL_SCALE = 0.75
 
 QUEST_FINGER_JOINTS = {
     "thumb": ("ThumbMetacarpal", "ThumbTip"),
@@ -214,6 +219,10 @@ class DfqModelAdapter:
         self.open_ctrl = np.clip(np.zeros(self.model.nu, dtype=float), self.ctrl_lower, self.ctrl_upper)
         self.thumb_yaw_index = self.actuator_joint_names.index(f"{self.prefix}_thumb_proximal_yaw_joint")
         self.thumb_pitch_index = self.actuator_joint_names.index(f"{self.prefix}_thumb_proximal_pitch_joint")
+        self.finger_ctrl_indices = {
+            finger: self.actuator_joint_names.index(f"{self.prefix}_{finger}_proximal_joint")
+            for finger in NON_THUMB_FINGERS
+        }
 
         self._joint_ids = {
             name: _required_id(self.model, mujoco.mjtObj.mjOBJ_JOINT, name)
@@ -332,17 +341,61 @@ class DfqModelAdapter:
                 ctrl[index] = assignments[joint_name]
         return np.clip(ctrl, self.ctrl_lower, self.ctrl_upper)
 
+    def retarget_target_features(self, target: FingerFeatureSet) -> FingerFeatureSet:
+        directions = dict(target.directions)
+        thumb_direction = _normalize(THUMB_DIRECTION_CALIBRATION @ target.directions["thumb"])
+        if thumb_direction is None:
+            thumb_direction = target.directions["thumb"]
+        directions["thumb"] = thumb_direction
+        for finger in NON_THUMB_FINGERS:
+            calibrated = _normalize(NON_THUMB_DIRECTION_CALIBRATION @ target.directions[finger])
+            if calibrated is not None:
+                directions[finger] = calibrated
+        bends = dict(target.bends)
+        bends["thumb"] = self.thumb_bend_to_pitch(target.bends["thumb"])
+        for finger in NON_THUMB_FINGERS:
+            bends[finger] = self.non_thumb_bend_to_ctrl(finger, target.bends[finger])
+        distances = dict(target.distances)
+        distances["thumb"] = self.projected_thumb_distance(
+            thumb_direction,
+            target.distances["thumb"],
+            bends["thumb"],
+        )
+        distances.update(self.projected_non_thumb_distances(bends))
+        return FingerFeatureSet(
+            directions=directions,
+            distances=distances,
+            bends=bends,
+        )
+
     def thumb_ctrl_guess(self, target: FingerFeatureSet) -> tuple[float, float]:
         target_pitch = float(
             np.clip(
-                target.bends["thumb"] * 0.55,
+                target.bends["thumb"],
                 self.ctrl_lower[self.thumb_pitch_index],
                 self.ctrl_upper[self.thumb_pitch_index],
             )
         )
-        target_direction = target.directions["thumb"]
+        index = self._thumb_lookup_index(
+            target.directions["thumb"],
+            target.distances["thumb"],
+            target_pitch,
+        )
+        yaw, pitch = self._thumb_lookup_ctrls[index]
+        return float(yaw), float(pitch)
+
+    def projected_thumb_distance(self, direction: np.ndarray, distance: float, pitch: float) -> float:
+        index = self._thumb_lookup_index(direction, distance, pitch)
+        yaw, pitch = self._thumb_lookup_ctrls[index]
+        ctrl = self.open_ctrl.copy()
+        ctrl[self.thumb_yaw_index] = yaw
+        ctrl[self.thumb_pitch_index] = pitch
+        features = self.finger_features_for_ctrl(ctrl)
+        return float(features.distances["thumb"])
+
+    def _thumb_lookup_index(self, target_direction: np.ndarray, target_distance: float, target_pitch: float) -> int:
         direction_error = self._thumb_lookup_features["directions"] - target_direction
-        distance_error = self._thumb_lookup_features["distances"] - target.distances["thumb"]
+        distance_error = self._thumb_lookup_features["distances"] - float(target_distance)
         pitch_error = self._thumb_lookup_ctrls[:, 1] - target_pitch
         residual = np.column_stack(
             (
@@ -351,9 +404,33 @@ class DfqModelAdapter:
                 pitch_error[:, None] * THUMB_LOOKUP_PITCH_WEIGHT,
             )
         )
-        index = int(np.argmin(np.einsum("ij,ij->i", residual, residual)))
-        yaw, pitch = self._thumb_lookup_ctrls[index]
-        return float(yaw), float(pitch)
+        return int(np.argmin(np.einsum("ij,ij->i", residual, residual)))
+
+    def thumb_bend_to_pitch(self, bend: float) -> float:
+        return float(
+            np.clip(
+                bend * THUMB_BEND_TO_PITCH_SCALE,
+                self.ctrl_lower[self.thumb_pitch_index],
+                self.ctrl_upper[self.thumb_pitch_index],
+            )
+        )
+
+    def non_thumb_bend_to_ctrl(self, finger: str, bend: float) -> float:
+        index = self.finger_ctrl_indices[finger]
+        return float(
+            np.clip(
+                bend * NON_THUMB_BEND_TO_CTRL_SCALE,
+                self.ctrl_lower[index],
+                self.ctrl_upper[index],
+            )
+        )
+
+    def projected_non_thumb_distances(self, bends: dict[str, float]) -> dict[str, float]:
+        ctrl = self.open_ctrl.copy()
+        for finger in NON_THUMB_FINGERS:
+            ctrl[self.finger_ctrl_indices[finger]] = bends[finger]
+        features = self.finger_features_for_ctrl(ctrl)
+        return {finger: float(features.distances[finger]) for finger in NON_THUMB_FINGERS}
 
     def _build_thumb_lookup(self) -> tuple[np.ndarray, dict[str, np.ndarray]]:
         yaw_values = np.linspace(
@@ -448,6 +525,8 @@ class DfqRetargeter:
             smoothed_ctrl = raw_ctrl
         else:
             smoothed_ctrl = self.ema_alpha * self._last_smoothed_ctrl + (1.0 - self.ema_alpha) * raw_ctrl
+            smoothed_ctrl[self.adapter.thumb_yaw_index] = raw_ctrl[self.adapter.thumb_yaw_index]
+            smoothed_ctrl[self.adapter.thumb_pitch_index] = raw_ctrl[self.adapter.thumb_pitch_index]
         smoothed_ctrl = np.clip(smoothed_ctrl, self.adapter.ctrl_lower, self.adapter.ctrl_upper)
         self._last_smoothed_ctrl = smoothed_ctrl
         command = self._command(
@@ -461,6 +540,7 @@ class DfqRetargeter:
         return command
 
     def _solve(self, target: FingerFeatureSet) -> tuple[np.ndarray, float]:
+        target = self.adapter.retarget_target_features(target)
         bend_guess = self.adapter.quest_bend_to_ctrl(target)
         warm_start = self.current_ctrl
         if self._last_smoothed_ctrl is None:
@@ -497,7 +577,9 @@ class DfqRetargeter:
             gtol=1e-4,
         )
         ctrl = np.clip(np.asarray(result.x, dtype=float), self.adapter.ctrl_lower, self.adapter.ctrl_upper)
-        loss = float(np.linalg.norm(result.fun))
+        ctrl[self.adapter.thumb_yaw_index] = bend_guess[self.adapter.thumb_yaw_index]
+        ctrl[self.adapter.thumb_pitch_index] = bend_guess[self.adapter.thumb_pitch_index]
+        loss = float(np.linalg.norm(residual(ctrl)))
         return ctrl, loss
 
     def _nudge_from_active_lower_bounds(self, ctrl: np.ndarray, bend_guess: np.ndarray) -> np.ndarray:

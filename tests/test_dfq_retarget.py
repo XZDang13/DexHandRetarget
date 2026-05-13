@@ -166,6 +166,27 @@ class DfqModelAdapterTests(unittest.TestCase):
             features = adapter.finger_features_for_ctrl(adapter.open_ctrl)
             self.assertEqual(set(features.directions), {"thumb", "index", "middle", "ring", "pinky"})
 
+    def test_thumb_target_features_are_calibrated(self) -> None:
+        adapter = DfqModelAdapter(default_dfq_model_path("right"), "right")
+        features = extract_quest_hand_features(synthetic_frame().hands[0])
+        assert features is not None
+
+        calibrated = adapter.retarget_target_features(features)
+
+        self.assertAlmostEqual(calibrated.directions["thumb"][0], features.directions["thumb"][0])
+        self.assertAlmostEqual(calibrated.directions["thumb"][1], features.directions["thumb"][1])
+        self.assertAlmostEqual(calibrated.directions["thumb"][2], -features.directions["thumb"][2])
+        self.assertAlmostEqual(calibrated.bends["thumb"], adapter.thumb_bend_to_pitch(features.bends["thumb"]))
+        self.assertTrue(math.isfinite(calibrated.distances["thumb"]))
+        self.assertGreater(calibrated.distances["thumb"], 0.0)
+        for finger in ("index", "middle", "ring", "pinky"):
+            self.assertAlmostEqual(calibrated.directions[finger][0], -features.directions[finger][0])
+            self.assertAlmostEqual(calibrated.directions[finger][1], features.directions[finger][1])
+            self.assertAlmostEqual(calibrated.directions[finger][2], -features.directions[finger][2])
+            self.assertAlmostEqual(calibrated.bends[finger], adapter.non_thumb_bend_to_ctrl(finger, features.bends[finger]))
+            self.assertTrue(math.isfinite(calibrated.distances[finger]))
+            self.assertGreater(calibrated.distances[finger], 0.0)
+
 
 class DfqRetargeterTests(unittest.TestCase):
     def test_ik_returns_bounded_command(self) -> None:
@@ -199,7 +220,7 @@ class DfqRetargeterTests(unittest.TestCase):
         adapter = DfqModelAdapter(default_dfq_model_path("right"), "right")
         retargeter = DfqRetargeter(adapter, "right", ema_alpha=0.0, max_nfev=20)
 
-        command = retargeter.command_for_frame(thumb_opposition_frame(sequence=9, z_offset=0.1))
+        command = retargeter.command_for_frame(thumb_opposition_frame(sequence=9, z_offset=-0.1))
 
         self.assertEqual(command.mode, "tracking")
         ctrl = np.asarray(command.ctrl)

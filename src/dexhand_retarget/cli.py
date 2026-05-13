@@ -91,6 +91,34 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="In --replay mode, process every frame without opening a viewer and exit.",
     )
+    parser.add_argument(
+        "--eval-replay",
+        type=Path,
+        metavar="PATH",
+        help="Evaluate a saved replay against the DFQ retargeter and exit.",
+    )
+    parser.add_argument(
+        "--eval-output",
+        type=Path,
+        metavar="PATH",
+        help="Write the replay evaluation JSON report to this path.",
+    )
+    parser.add_argument(
+        "--eval-stride",
+        type=int,
+        default=1,
+        help="Evaluate every Nth replay frame.",
+    )
+    parser.add_argument(
+        "--eval-max-frames",
+        type=int,
+        help="Stop reading the replay after this many frames.",
+    )
+    parser.add_argument(
+        "--eval-no-details",
+        action="store_true",
+        help="Omit per-frame thumb details from the evaluation JSON report.",
+    )
     return parser
 
 
@@ -104,8 +132,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.replay_headless and args.replay is None:
         print("--replay-headless requires --replay", file=sys.stderr)
         return 2
+    if args.eval_replay is not None and (args.save_replay is not None or args.replay is not None):
+        print("--eval-replay cannot be used together with --save-replay or --replay", file=sys.stderr)
+        return 2
 
     log_stream = sys.stderr if args.retarget_dfq and args.command_output == "stdout" else sys.stdout
+
+    if args.eval_replay is not None:
+        return run_eval_replay(args, log_stream)
 
     if args.replay is not None and args.replay_headless:
         return run_headless_replay(args, log_stream)
@@ -322,6 +356,46 @@ def run_headless_replay(args: argparse.Namespace, log_stream: TextIO) -> int:
         print(f"Replay failed: {exc}", file=sys.stderr)
         return 1
     print(f"[replay] Finished {count} frame(s)", file=log_stream, flush=True)
+    return 0
+
+
+def run_eval_replay(args: argparse.Namespace, log_stream: TextIO) -> int:
+    try:
+        from .eval_retarget import (
+            EvaluationConfig,
+            EvaluationError,
+            evaluate_replay,
+            print_summary,
+            write_report,
+        )
+        from .replay import ReplayError
+    except ImportError as exc:
+        print(
+            "Missing Python dependency. Run: python -m pip install -r requirements.txt",
+            file=sys.stderr,
+        )
+        print(f"Import error: {exc}", file=sys.stderr)
+        return 1
+
+    config = EvaluationConfig(
+        replay_path=args.eval_replay,
+        hand=args.hand,
+        model_path=args.dfq_model_path,
+        ema_alpha=args.retarget_alpha,
+        max_nfev=args.retarget_max_nfev,
+        stride=args.eval_stride,
+        max_frames=args.eval_max_frames,
+        include_details=not args.eval_no_details,
+    )
+    try:
+        report = evaluate_replay(config)
+        if args.eval_output is not None:
+            write_report(report, args.eval_output)
+            print(f"[eval] Wrote report to {args.eval_output}", file=log_stream, flush=True)
+        print_summary(report, stream=log_stream)
+    except (EvaluationError, ReplayError, OSError, ValueError) as exc:
+        print(f"Evaluation failed: {exc}", file=sys.stderr)
+        return 1
     return 0
 
 

@@ -91,6 +91,26 @@ Use `--replay-speed 2.0` to play recorded timing at 2x speed, `--replay-fps 90`
 to force a fixed playback rate, and `--replay-loop` to loop while a viewer is
 open.
 
+## Replay Evaluation
+
+Evaluate a saved replay against the current DFQ retargeter without opening a
+viewer:
+
+```bash
+python server.py --eval-replay replays/right_hand.jsonl --hand right
+python server.py --eval-replay replays/right_hand.jsonl --hand right --eval-output report.json
+```
+
+The evaluator prints a compact summary and, when `--eval-output` is provided,
+writes a JSON report with coverage, thumb geometry errors, command smoothness,
+estimated thumb yaw/pitch lag, and per-frame thumb details. Use `--eval-stride`
+and `--eval-max-frames` for quick parameter sweeps:
+
+```bash
+python server.py --eval-replay replays/right_hand.jsonl --hand right --eval-stride 10
+python server.py --eval-replay replays/right_hand.jsonl --hand right --retarget-alpha 0.0 --retarget-max-nfev 15
+```
+
 ## DFQ Retarget
 
 Run the receiver with the MuJoCo DFQ retarget viewer:
