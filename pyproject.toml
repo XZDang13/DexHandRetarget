@@ -1,0 +1,23 @@
+[project]
+name = "dexhand-retarget"
+version = "0.5.0"
+description = "Quest hand tracking receiver and debug visualizer for dexterous hand retargeting experiments"
+requires-python = ">=3.10"
+dependencies = [
+    "aiohttp>=3.9",
+    "aiortc>=1.8",
+    "matplotlib>=3.8",
+    "mujoco>=3.2",
+    "numpy>=1.26",
+    "scipy>=1.10",
+]
+
+[project.scripts]
+dexhand-retarget = "dexhand_retarget.cli:main"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
