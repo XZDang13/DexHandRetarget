@@ -31,6 +31,10 @@ THUMB_LOOKUP_PITCH_WEIGHT = 2.5
 CTRL_REGULARIZATION_WEIGHT = 0.03
 DEFAULT_MAX_NFEV = 25
 DEFAULT_EMA_ALPHA = 0.45
+DEFAULT_MAX_CTRL_STEP = 0.16
+DEFAULT_RELEASE_MAX_CTRL_STEP = 0.12
+DEFAULT_FEATURE_ALPHA = 0.35
+DEFAULT_FEATURE_DEADBAND = 0.015
 VIEWER_DT = 1.0 / 60.0
 THUMB_LOOKUP_YAW_SAMPLES = 31
 THUMB_LOOKUP_PITCH_SAMPLES = 41
@@ -488,14 +492,25 @@ class DfqRetargeter:
         *,
         ema_alpha: float = DEFAULT_EMA_ALPHA,
         max_nfev: int = DEFAULT_MAX_NFEV,
+        max_ctrl_step: float | None = DEFAULT_MAX_CTRL_STEP,
+        release_max_ctrl_step: float | None = DEFAULT_RELEASE_MAX_CTRL_STEP,
+        feature_alpha: float = DEFAULT_FEATURE_ALPHA,
+        feature_deadband: float = DEFAULT_FEATURE_DEADBAND,
     ) -> None:
         self.adapter = adapter
         self.hand_side = normalize_hand_side(hand)
         self.handedness = canonical_handedness(hand)
         self.ema_alpha = float(ema_alpha)
         self.max_nfev = int(max_nfev)
+        self.max_ctrl_step = None if max_ctrl_step is None or max_ctrl_step <= 0.0 else float(max_ctrl_step)
+        self.release_max_ctrl_step = (
+            None if release_max_ctrl_step is None or release_max_ctrl_step <= 0.0 else float(release_max_ctrl_step)
+        )
+        self.feature_alpha = float(np.clip(feature_alpha, 0.0, 0.999))
+        self.feature_deadband = max(0.0, float(feature_deadband))
         self._last_smoothed_ctrl: np.ndarray | None = None
         self._last_successful_command: DfqCommand | None = None
+        self._last_filtered_features: FingerFeatureSet | None = None
 
     @property
     def current_ctrl(self) -> np.ndarray:
@@ -519,14 +534,16 @@ class DfqRetargeter:
                     loss=self._last_successful_command.loss,
                 )
             return self._waiting_command(sequence=frame.sequence, timestamp=frame.timestamp)
+        features = self._filter_features(features)
 
         raw_ctrl, loss = self._solve(features)
         if self._last_smoothed_ctrl is None:
-            smoothed_ctrl = raw_ctrl
+            smoothed_ctrl = self._limit_ctrl_step(raw_ctrl, self.adapter.open_ctrl)
         else:
             smoothed_ctrl = self.ema_alpha * self._last_smoothed_ctrl + (1.0 - self.ema_alpha) * raw_ctrl
             smoothed_ctrl[self.adapter.thumb_yaw_index] = raw_ctrl[self.adapter.thumb_yaw_index]
             smoothed_ctrl[self.adapter.thumb_pitch_index] = raw_ctrl[self.adapter.thumb_pitch_index]
+            smoothed_ctrl = self._limit_ctrl_step(smoothed_ctrl, self._last_smoothed_ctrl)
         smoothed_ctrl = np.clip(smoothed_ctrl, self.adapter.ctrl_lower, self.adapter.ctrl_upper)
         self._last_smoothed_ctrl = smoothed_ctrl
         command = self._command(
@@ -592,6 +609,59 @@ class DfqRetargeter:
                     nudged[index] = min(self.adapter.ctrl_upper[index], self.adapter.ctrl_lower[index] + spans[index] * 0.01)
         return nudged
 
+    def _limit_ctrl_step(self, target_ctrl: np.ndarray, previous_ctrl: np.ndarray) -> np.ndarray:
+        if self.max_ctrl_step is None:
+            return target_ctrl
+        lower = np.full_like(target_ctrl, -self.max_ctrl_step)
+        upper = np.full_like(target_ctrl, self.max_ctrl_step)
+        if self.release_max_ctrl_step is not None:
+            release_step = min(self.max_ctrl_step, self.release_max_ctrl_step)
+            for finger in NON_THUMB_FINGERS:
+                index = self.adapter.finger_ctrl_indices[finger]
+                lower[index] = -release_step
+        delta = np.clip(target_ctrl - previous_ctrl, lower, upper)
+        return previous_ctrl + delta
+
+    def _filter_features(self, features: FingerFeatureSet) -> FingerFeatureSet:
+        previous = self._last_filtered_features
+        if previous is None:
+            self._last_filtered_features = features
+            return features
+
+        directions: dict[str, np.ndarray] = {}
+        distances: dict[str, float] = {}
+        bends: dict[str, float] = {}
+        for finger in FINGERS:
+            directions[finger] = self._filter_direction(
+                previous.directions[finger],
+                features.directions[finger],
+            )
+            distances[finger] = self._filter_scalar(
+                previous.distances[finger],
+                features.distances[finger],
+            )
+            bends[finger] = self._filter_scalar(previous.bends[finger], features.bends[finger])
+
+        filtered = FingerFeatureSet(directions=directions, distances=distances, bends=bends)
+        self._last_filtered_features = filtered
+        return filtered
+
+    def _filter_direction(self, previous: np.ndarray, current: np.ndarray) -> np.ndarray:
+        angle = _angle_between_unit_vectors(previous, current)
+        if angle <= self.feature_deadband:
+            return np.asarray(previous, dtype=float)
+        if self.feature_alpha <= 0.0:
+            return np.asarray(current, dtype=float)
+        filtered = _normalize(self.feature_alpha * previous + (1.0 - self.feature_alpha) * current)
+        return np.asarray(current, dtype=float) if filtered is None else filtered
+
+    def _filter_scalar(self, previous: float, current: float) -> float:
+        if abs(float(current) - float(previous)) <= self.feature_deadband:
+            return float(previous)
+        if self.feature_alpha <= 0.0:
+            return float(current)
+        return float(self.feature_alpha * previous + (1.0 - self.feature_alpha) * current)
+
     def _waiting_command(self, *, sequence: int, timestamp: float) -> DfqCommand:
         return self._command(
             sequence=sequence,
@@ -647,14 +717,36 @@ class DfqRetargetRunner:
         log_stream: TextIO,
         ema_alpha: float = DEFAULT_EMA_ALPHA,
         max_nfev: int = DEFAULT_MAX_NFEV,
+        max_ctrl_step: float | None = DEFAULT_MAX_CTRL_STEP,
+        release_max_ctrl_step: float | None = DEFAULT_RELEASE_MAX_CTRL_STEP,
+        feature_alpha: float = DEFAULT_FEATURE_ALPHA,
+        feature_deadband: float = DEFAULT_FEATURE_DEADBAND,
+        live_log_interval: float = 0.0,
     ) -> None:
         self.state = state
         self.model_path = Path(model_path) if model_path else default_dfq_model_path(hand)
         self.adapter = DfqModelAdapter(self.model_path, hand)
-        self.retargeter = DfqRetargeter(self.adapter, hand, ema_alpha=ema_alpha, max_nfev=max_nfev)
+        self.retargeter = DfqRetargeter(
+            self.adapter,
+            hand,
+            ema_alpha=ema_alpha,
+            max_nfev=max_nfev,
+            max_ctrl_step=max_ctrl_step,
+            release_max_ctrl_step=release_max_ctrl_step,
+            feature_alpha=feature_alpha,
+            feature_deadband=feature_deadband,
+        )
         self.writer = CommandWriter(command_output)
         self.log_stream = log_stream
+        self.live_log_interval = max(0.0, float(live_log_interval))
         self._last_processed_sequence: int | None = None
+        self._last_live_log_at = time.monotonic()
+        self._last_command: DfqCommand | None = None
+        self._last_command_ctrl: np.ndarray | None = None
+        self._commands_since_log = 0
+        self._max_ctrl_step_since_log = 0.0
+        self._max_thumb_step_since_log = 0.0
+        self._max_actuator_step_since_log = 0.0
 
     def show(self) -> None:
         import mujoco.viewer
@@ -677,6 +769,8 @@ class DfqRetargetRunner:
                     with viewer.lock():
                         self.adapter.apply_ctrl(command.ctrl)
                     self.writer.write(command)
+                    self._record_live_command(command)
+                self._maybe_log_live(snapshot)
                 viewer.sync()
                 time.sleep(VIEWER_DT)
 
@@ -687,6 +781,52 @@ class DfqRetargetRunner:
             return None
         self._last_processed_sequence = frame.sequence
         return self.retargeter.command_for_frame(frame)
+
+    def _record_live_command(self, command: DfqCommand) -> None:
+        ctrl = np.asarray(command.ctrl, dtype=float)
+        if self._last_command_ctrl is not None:
+            ctrl_step = float(np.linalg.norm(ctrl - self._last_command_ctrl))
+            actuator_step = float(np.max(np.abs(ctrl - self._last_command_ctrl)))
+            thumb_indices = [self.adapter.thumb_yaw_index, self.adapter.thumb_pitch_index]
+            thumb_step = float(np.linalg.norm(ctrl[thumb_indices] - self._last_command_ctrl[thumb_indices]))
+            self._max_ctrl_step_since_log = max(self._max_ctrl_step_since_log, ctrl_step)
+            self._max_thumb_step_since_log = max(self._max_thumb_step_since_log, thumb_step)
+            self._max_actuator_step_since_log = max(self._max_actuator_step_since_log, actuator_step)
+        self._last_command = command
+        self._last_command_ctrl = ctrl
+        self._commands_since_log += 1
+
+    def _maybe_log_live(self, snapshot: dict[str, Any]) -> None:
+        if self.live_log_interval <= 0.0:
+            return
+        now = time.monotonic()
+        if now - self._last_live_log_at < self.live_log_interval:
+            return
+        frame = snapshot["latest_frame"]
+        frame_sequence = "-" if frame is None else frame.sequence
+        last_rx_age = "-" if snapshot["last_message_at"] <= 0.0 else f"{now - snapshot['last_message_at']:.2f}s"
+        command = self._last_command
+        mode = "-" if command is None else command.mode
+        loss = "-" if command is None or command.loss is None else f"{command.loss:.3g}"
+        ctrl = self.retargeter.current_ctrl
+        print(
+            "[dfq-live] "
+            f"seq={frame_sequence} mode={mode} "
+            f"peer={snapshot['peer_state']} channel={snapshot['channel_state']} "
+            f"rx_fps={snapshot['rx_fps']:.1f} last_rx_age={last_rx_age} "
+            f"cmds={self._commands_since_log} loss={loss} "
+            f"ctrl_step_max={self._max_ctrl_step_since_log:.4f} "
+            f"thumb_step_max={self._max_thumb_step_since_log:.4f} "
+            f"actuator_step_max={self._max_actuator_step_since_log:.4f} "
+            f"ctrl={[round(float(value), 3) for value in ctrl]}",
+            file=self.log_stream,
+            flush=True,
+        )
+        self._last_live_log_at = now
+        self._commands_since_log = 0
+        self._max_ctrl_step_since_log = 0.0
+        self._max_thumb_step_since_log = 0.0
+        self._max_actuator_step_since_log = 0.0
 
 
 def _tracked_joint_position(joints: dict[str, Any], joint_name: str) -> np.ndarray | None:
@@ -724,13 +864,17 @@ def _norm(vector: np.ndarray) -> float:
     return float(np.linalg.norm(vector))
 
 
+def _angle_between_unit_vectors(first: np.ndarray, second: np.ndarray) -> float:
+    cosine = float(np.clip(np.dot(first, second), -1.0, 1.0))
+    return float(np.arccos(cosine))
+
+
 def _joint_bend_angle(base: np.ndarray, middle: np.ndarray, tip: np.ndarray) -> float | None:
     first = _normalize(middle - base)
     second = _normalize(tip - middle)
     if first is None or second is None:
         return None
-    cosine = float(np.clip(np.dot(first, second), -1.0, 1.0))
-    return float(np.arccos(cosine))
+    return _angle_between_unit_vectors(first, second)
 
 
 def _required_id(model: mujoco.MjModel, object_type: mujoco.mjtObj, name: str) -> int:

@@ -59,6 +59,36 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum SciPy least_squares evaluations per retarget frame.",
     )
     parser.add_argument(
+        "--retarget-max-step",
+        type=float,
+        default=0.16,
+        help="Maximum per-actuator ctrl change per frame. Use 0 to disable rate limiting.",
+    )
+    parser.add_argument(
+        "--retarget-release-max-step",
+        type=float,
+        default=0.12,
+        help="Maximum non-thumb finger opening ctrl change per frame. Use 0 to match --retarget-max-step.",
+    )
+    parser.add_argument(
+        "--retarget-feature-alpha",
+        type=float,
+        default=0.35,
+        help="EMA smoothing alpha for Quest palm-frame finger features. Use 0 to disable feature smoothing.",
+    )
+    parser.add_argument(
+        "--retarget-feature-deadband",
+        type=float,
+        default=0.015,
+        help="Deadband for Quest feature jitter: radians for directions/bends and normalized units for distances.",
+    )
+    parser.add_argument(
+        "--live-log-interval",
+        type=float,
+        default=0.0,
+        help="Print live DFQ retarget diagnostics every N seconds. Use 0 to disable.",
+    )
+    parser.add_argument(
         "--save-replay",
         type=Path,
         metavar="PATH",
@@ -334,6 +364,10 @@ def run_headless_replay(args: argparse.Namespace, log_stream: TextIO) -> int:
             args.hand,
             ema_alpha=args.retarget_alpha,
             max_nfev=args.retarget_max_nfev,
+            max_ctrl_step=args.retarget_max_step,
+            release_max_ctrl_step=args.retarget_release_max_step,
+            feature_alpha=args.retarget_feature_alpha,
+            feature_deadband=args.retarget_feature_deadband,
         )
     except Exception as exc:
         print(f"Failed to initialize DFQ retargeter: {exc}", file=sys.stderr)
@@ -383,6 +417,10 @@ def run_eval_replay(args: argparse.Namespace, log_stream: TextIO) -> int:
         model_path=args.dfq_model_path,
         ema_alpha=args.retarget_alpha,
         max_nfev=args.retarget_max_nfev,
+        max_ctrl_step=args.retarget_max_step,
+        release_max_ctrl_step=args.retarget_release_max_step,
+        feature_alpha=args.retarget_feature_alpha,
+        feature_deadband=args.retarget_feature_deadband,
         stride=args.eval_stride,
         max_frames=args.eval_max_frames,
         include_details=not args.eval_no_details,
@@ -410,6 +448,11 @@ def show_viewer(args: argparse.Namespace, state: SharedState, log_stream: TextIO
             command_output=args.command_output,
             ema_alpha=args.retarget_alpha,
             max_nfev=args.retarget_max_nfev,
+            live_log_interval=args.live_log_interval,
+            max_ctrl_step=args.retarget_max_step,
+            release_max_ctrl_step=args.retarget_release_max_step,
+            feature_alpha=args.retarget_feature_alpha,
+            feature_deadband=args.retarget_feature_deadband,
             log_stream=log_stream,
         )
         runner.show()

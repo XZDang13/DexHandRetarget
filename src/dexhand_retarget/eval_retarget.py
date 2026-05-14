@@ -39,6 +39,10 @@ class EvaluationConfig:
     model_path: Path | None = None
     ema_alpha: float = 0.45
     max_nfev: int = 25
+    max_ctrl_step: float = 0.16
+    release_max_ctrl_step: float = 0.12
+    feature_alpha: float = 0.35
+    feature_deadband: float = 0.015
     stride: int = 1
     max_frames: int | None = None
     include_details: bool = True
@@ -169,12 +173,20 @@ def evaluate_replay(config: EvaluationConfig) -> dict[str, Any]:
         config.hand,
         ema_alpha=0.0,
         max_nfev=config.max_nfev,
+        max_ctrl_step=0.0,
+        release_max_ctrl_step=0.0,
+        feature_alpha=0.0,
+        feature_deadband=0.0,
     )
     configured_retargeter = DfqRetargeter(
         configured_adapter,
         config.hand,
         ema_alpha=config.ema_alpha,
         max_nfev=config.max_nfev,
+        max_ctrl_step=config.max_ctrl_step,
+        release_max_ctrl_step=config.release_max_ctrl_step,
+        feature_alpha=config.feature_alpha,
+        feature_deadband=config.feature_deadband,
     )
 
     prior_acc = MethodAccumulator.create("prior_lookup_only")
@@ -282,6 +294,10 @@ def evaluate_replay(config: EvaluationConfig) -> dict[str, Any]:
             "model_path": str(model_path),
             "ema_alpha": config.ema_alpha,
             "max_nfev": config.max_nfev,
+            "max_ctrl_step": config.max_ctrl_step,
+            "release_max_ctrl_step": config.release_max_ctrl_step,
+            "feature_alpha": config.feature_alpha,
+            "feature_deadband": config.feature_deadband,
             "stride": config.stride,
             "max_frames": config.max_frames,
         },

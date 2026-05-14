@@ -208,7 +208,7 @@ class DfqRetargeterTests(unittest.TestCase):
 
     def test_curled_quest_fingers_drive_non_thumb_controls(self) -> None:
         adapter = DfqModelAdapter(default_dfq_model_path("right"), "right")
-        retargeter = DfqRetargeter(adapter, "right", ema_alpha=0.0, max_nfev=20)
+        retargeter = DfqRetargeter(adapter, "right", ema_alpha=0.0, max_nfev=20, max_ctrl_step=0.0)
 
         command = retargeter.command_for_frame(curled_frame(sequence=7))
 
@@ -218,7 +218,7 @@ class DfqRetargeterTests(unittest.TestCase):
 
     def test_thumb_opposition_drives_thumb_yaw(self) -> None:
         adapter = DfqModelAdapter(default_dfq_model_path("right"), "right")
-        retargeter = DfqRetargeter(adapter, "right", ema_alpha=0.0, max_nfev=20)
+        retargeter = DfqRetargeter(adapter, "right", ema_alpha=0.0, max_nfev=20, max_ctrl_step=0.0)
 
         command = retargeter.command_for_frame(thumb_opposition_frame(sequence=9, z_offset=-0.1))
 
@@ -246,6 +246,61 @@ class DfqRetargeterTests(unittest.TestCase):
         self.assertEqual(waiting.mode, "waiting")
         self.assertEqual(waiting.ctrl, tuple(float(value) for value in adapter.open_ctrl))
 
+    def test_rate_limit_caps_per_actuator_step(self) -> None:
+        adapter = DfqModelAdapter(default_dfq_model_path("right"), "right")
+        retargeter = DfqRetargeter(adapter, "right", ema_alpha=0.0, max_nfev=8, max_ctrl_step=0.05)
+        first = retargeter.command_for_frame(synthetic_frame(sequence=1))
+
+        second = retargeter.command_for_frame(curled_frame(sequence=2, curl=0.12))
+
+        step = np.abs(np.asarray(second.ctrl) - np.asarray(first.ctrl))
+        self.assertTrue(np.all(step <= 0.0500001))
+
+    def test_rate_limit_caps_first_tracking_step_from_open_pose(self) -> None:
+        adapter = DfqModelAdapter(default_dfq_model_path("right"), "right")
+        retargeter = DfqRetargeter(adapter, "right", ema_alpha=0.0, max_nfev=8, max_ctrl_step=0.05)
+
+        command = retargeter.command_for_frame(curled_frame(sequence=1, curl=0.12))
+
+        step = np.abs(np.asarray(command.ctrl) - adapter.open_ctrl)
+        self.assertTrue(np.all(step <= 0.0500001))
+
+    def test_feature_deadband_holds_small_input_jitter(self) -> None:
+        adapter = DfqModelAdapter(default_dfq_model_path("right"), "right")
+        retargeter = DfqRetargeter(
+            adapter,
+            "right",
+            ema_alpha=0.0,
+            max_nfev=8,
+            max_ctrl_step=0.0,
+            feature_alpha=0.0,
+            feature_deadband=0.05,
+        )
+        first = retargeter.command_for_frame(synthetic_frame(sequence=1))
+
+        second = retargeter.command_for_frame(curled_frame(sequence=2, curl=0.002))
+
+        np.testing.assert_allclose(second.ctrl, first.ctrl, atol=1e-9)
+
+    def test_release_limit_slows_non_thumb_opening(self) -> None:
+        adapter = DfqModelAdapter(default_dfq_model_path("right"), "right")
+        retargeter = DfqRetargeter(
+            adapter,
+            "right",
+            ema_alpha=0.0,
+            max_nfev=8,
+            max_ctrl_step=10.0,
+            release_max_ctrl_step=0.02,
+            feature_alpha=0.0,
+            feature_deadband=0.0,
+        )
+        closed = retargeter.command_for_frame(curled_frame(sequence=1, curl=0.12))
+
+        opening = retargeter.command_for_frame(synthetic_frame(sequence=2))
+
+        delta = np.asarray(opening.ctrl) - np.asarray(closed.ctrl)
+        self.assertTrue(np.all(delta[2:] >= -0.0200001))
+
 
 class CommandWriterTests(unittest.TestCase):
     def test_stdout_jsonl_schema_is_stable(self) -> None:
@@ -268,12 +323,33 @@ class CommandWriterTests(unittest.TestCase):
 class CliParserTests(unittest.TestCase):
     def test_retarget_dfq_args_parse(self) -> None:
         args = build_parser().parse_args(
-            ["--retarget-dfq", "--hand", "right", "--command-output", "stdout"]
+            [
+                "--retarget-dfq",
+                "--hand",
+                "right",
+                "--command-output",
+                "stdout",
+                "--live-log-interval",
+                "1.5",
+                "--retarget-max-step",
+                "0.12",
+                "--retarget-release-max-step",
+                "0.06",
+                "--retarget-feature-alpha",
+                "0.4",
+                "--retarget-feature-deadband",
+                "0.02",
+            ]
         )
 
         self.assertTrue(args.retarget_dfq)
         self.assertEqual(args.hand, "right")
         self.assertEqual(args.command_output, "stdout")
+        self.assertEqual(args.live_log_interval, 1.5)
+        self.assertEqual(args.retarget_max_step, 0.12)
+        self.assertEqual(args.retarget_release_max_step, 0.06)
+        self.assertEqual(args.retarget_feature_alpha, 0.4)
+        self.assertEqual(args.retarget_feature_deadband, 0.02)
 
 
 if __name__ == "__main__":

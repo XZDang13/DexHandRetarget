@@ -145,7 +145,13 @@ stays in the clipped open pose and emits `mode="waiting"`.
 Retargeting uses Quest finger bend as a strong prior and MuJoCo IK as a
 correction step. Use `--retarget-alpha` to tune command smoothing; lower values
 respond faster. Use `--retarget-max-nfev` to tune the per-frame IK iteration
-budget.
+budget. Use `--retarget-max-step` to cap per-actuator ctrl changes per frame;
+the default is `0.16`, and `0` disables the rate limiter. Use
+`--retarget-release-max-step` to slow non-thumb finger opening separately from
+closing; the default `0.12` helps prevent a held grasp from opening on brief
+Quest tracking jitter. Use `--retarget-feature-alpha` and
+`--retarget-feature-deadband` to smooth Quest palm-frame finger features before
+IK; defaults are `0.35` and `0.015`.
 
 ## Planned Next Layer
 
