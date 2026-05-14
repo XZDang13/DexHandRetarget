@@ -30,6 +30,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Retarget one Quest hand to the Inspire DFQ MuJoCo model.",
     )
     parser.add_argument(
+        "--real",
+        action="store_true",
+        help="Connect to a real Inspire hand and send commands to it.",
+    )
+    parser.add_argument(
         "--hand",
         choices=("left", "right"),
         default="right",
@@ -441,6 +446,13 @@ def show_viewer(args: argparse.Namespace, state: SharedState, log_stream: TextIO
     if args.retarget_dfq:
         from .dfq_retarget import DfqRetargetRunner
 
+        real_hand = None
+
+        if args.real:
+            from .inspire_hand import RealInspireHand
+
+            real_hand = RealInspireHand()
+
         runner = DfqRetargetRunner(
             state,
             hand=args.hand,
@@ -454,6 +466,7 @@ def show_viewer(args: argparse.Namespace, state: SharedState, log_stream: TextIO
             feature_alpha=args.retarget_feature_alpha,
             feature_deadband=args.retarget_feature_deadband,
             log_stream=log_stream,
+            real_hand=real_hand,
         )
         runner.show()
     else:

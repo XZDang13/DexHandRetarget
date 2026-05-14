@@ -722,6 +722,7 @@ class DfqRetargetRunner:
         feature_alpha: float = DEFAULT_FEATURE_ALPHA,
         feature_deadband: float = DEFAULT_FEATURE_DEADBAND,
         live_log_interval: float = 0.0,
+        real_hand=None,
     ) -> None:
         self.state = state
         self.model_path = Path(model_path) if model_path else default_dfq_model_path(hand)
@@ -747,6 +748,7 @@ class DfqRetargetRunner:
         self._max_ctrl_step_since_log = 0.0
         self._max_thumb_step_since_log = 0.0
         self._max_actuator_step_since_log = 0.0
+        self.real_hand = real_hand
 
     def show(self) -> None:
         import mujoco.viewer
@@ -758,6 +760,8 @@ class DfqRetargetRunner:
         )
         initial = self.retargeter.command_for_frame(None)
         self.adapter.apply_ctrl(initial.ctrl)
+        if self.real_hand is not None:
+            self.real_hand.send(initial.ctrl)
         self.writer.write(initial)
 
         with mujoco.viewer.launch_passive(self.adapter.model, self.adapter.data) as viewer:
@@ -768,6 +772,8 @@ class DfqRetargetRunner:
                 if command is not None:
                     with viewer.lock():
                         self.adapter.apply_ctrl(command.ctrl)
+                    if self.real_hand is not None:
+                        self.real_hand.send(command.ctrl)
                     self.writer.write(command)
                     self._record_live_command(command)
                 self._maybe_log_live(snapshot)
