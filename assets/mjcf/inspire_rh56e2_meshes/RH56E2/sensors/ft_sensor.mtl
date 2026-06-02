@@ -1,0 +1,23 @@
+# File produced by Open Asset Import Library (http://www.assimp.sf.net)
+# (assimp v5.3.0)
+
+newmtl silver
+Kd 0.600000024 0.600000024 0.600000024
+Ke 0 0 0
+d 1
+Ns 250
+illum 2
+
+newmtl plug
+Kd 0.216638535 0.0215826109 0
+Ke 0 0 0
+d 1
+Ns 39.9999962
+illum 2
+
+newmtl $Material_2
+Kd 1 1 1
+Ke 0 0 0
+d 1
+illum 1
+

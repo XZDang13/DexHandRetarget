@@ -15,7 +15,7 @@ from .frames import HandSkeleton, HandSkeletonFrame
 from .state import SharedState
 
 
-COMMAND_TYPE = "dfq_command"
+COMMAND_TYPE = "retarget_command"
 COMMAND_VERSION = 1
 FINGERS = ("thumb", "index", "middle", "ring", "pinky")
 NON_THUMB_FINGERS = ("index", "middle", "ring", "pinky")
@@ -75,6 +75,31 @@ DFQ_FINGER_TIPS = {
     "pinky": "pinky_intermediate_tip",
 }
 
+RH56E2_FINGER_BASES = {
+    "thumb": "thumb_1",
+    "index": "index_1",
+    "middle": "middle_1",
+    "ring": "ring_1",
+    "pinky": "pinky_1",
+}
+
+RH56E2_FINGER_TIPS = {
+    "thumb": "thumb_tip",
+    "index": "index_tip",
+    "middle": "middle_tip",
+    "ring": "ring_tip",
+    "pinky": "pinky_tip",
+}
+
+RH56E2_ACTUATOR_JOINTS = (
+    "thumb_joint1",
+    "thumb_joint2",
+    "index_joint",
+    "middle_joint",
+    "ring_joint",
+    "pinky_joint",
+)
+
 
 @dataclass(frozen=True, slots=True)
 class FingerFeatureSet:
@@ -98,10 +123,11 @@ class ActuatorCommand:
 
 
 @dataclass(frozen=True, slots=True)
-class DfqCommand:
+class RetargetCommand:
     sequence: int
     timestamp: float
     hand: str
+    backend: str
     model: str
     mode: str
     ctrl: tuple[float, ...]
@@ -115,6 +141,7 @@ class DfqCommand:
             "sequence": self.sequence,
             "timestamp": self.timestamp,
             "hand": self.hand,
+            "backend": self.backend,
             "model": self.model,
             "mode": self.mode,
             "ctrl": list(self.ctrl),
@@ -123,10 +150,41 @@ class DfqCommand:
         }
 
 
+DfqCommand = RetargetCommand
+
+
 def default_dfq_model_path(hand: str) -> Path:
     project_root = Path(__file__).resolve().parents[2]
     side = normalize_hand_side(hand)
     return project_root / "assets" / "mjcf" / f"inspire_dfq_{side}" / "model.xml"
+
+
+def default_rh56e2_model_path(hand: str) -> Path:
+    project_root = Path(__file__).resolve().parents[2]
+    side = normalize_hand_side(hand)
+    return project_root / "assets" / "mjcf" / f"inspire_rh56e2_{side}" / "model.xml"
+
+
+def normalize_retarget_model(value: str) -> str:
+    model = value.strip().lower()
+    if model not in {"dfq", "rh56e2"}:
+        raise ValueError(f"Unsupported retarget model: {value}")
+    return model
+
+
+def default_model_path(retarget_model: str, hand: str) -> Path:
+    model = normalize_retarget_model(retarget_model)
+    if model == "dfq":
+        return default_dfq_model_path(hand)
+    return default_rh56e2_model_path(hand)
+
+
+def create_model_adapter(retarget_model: str, model_path: str | Path | None, hand: str):
+    model = normalize_retarget_model(retarget_model)
+    path = Path(model_path) if model_path else default_model_path(model, hand)
+    if model == "dfq":
+        return DfqModelAdapter(path, hand)
+    return Rh56e2ModelAdapter(path, hand)
 
 
 def normalize_hand_side(value: str) -> str:
@@ -195,6 +253,7 @@ def extract_quest_hand_features(hand: HandSkeleton) -> FingerFeatureSet | None:
 
 class DfqModelAdapter:
     def __init__(self, model_path: str | Path, hand: str) -> None:
+        self.backend_name = "dfq"
         self.model_path = Path(model_path)
         self.hand_side = normalize_hand_side(hand)
         self.handedness = canonical_handedness(hand)
@@ -484,10 +543,282 @@ class DfqModelAdapter:
         self.data.qpos[address] = float(np.clip(value, low, high))
 
 
-class DfqRetargeter:
+class Rh56e2ModelAdapter:
+    def __init__(self, model_path: str | Path, hand: str) -> None:
+        self.backend_name = "rh56e2"
+        self.model_path = Path(model_path)
+        self.hand_side = normalize_hand_side(hand)
+        self.handedness = canonical_handedness(hand)
+        self.model_name = self.model_path.parent.name
+        self.model = mujoco.MjModel.from_xml_path(str(self.model_path))
+        self.data = mujoco.MjData(self.model)
+
+        self.actuator_names = tuple(
+            _required_name(self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, index)
+            for index in range(self.model.nu)
+        )
+        self.actuator_joint_names = tuple(
+            _required_name(
+                self.model,
+                mujoco.mjtObj.mjOBJ_JOINT,
+                int(self.model.actuator_trnid[index, 0]),
+            )
+            for index in range(self.model.nu)
+        )
+        if self.actuator_joint_names != RH56E2_ACTUATOR_JOINTS:
+            raise ValueError(
+                "Expected RH56E2 actuator joints "
+                f"{RH56E2_ACTUATOR_JOINTS}, got {self.actuator_joint_names}"
+            )
+        self.ctrl_ranges = np.asarray(self.model.actuator_ctrlrange, dtype=float)
+        if self.ctrl_ranges.shape != (6, 2):
+            raise ValueError(f"Expected 6 RH56E2 actuators, got {self.model.nu}")
+        self.ctrl_lower = self.ctrl_ranges[:, 0]
+        self.ctrl_upper = self.ctrl_ranges[:, 1]
+        self.open_ctrl = np.clip(np.zeros(self.model.nu, dtype=float), self.ctrl_lower, self.ctrl_upper)
+        self.thumb_yaw_index = self.actuator_joint_names.index("thumb_joint1")
+        self.thumb_pitch_index = self.actuator_joint_names.index("thumb_joint2")
+        self.finger_ctrl_indices = {
+            "index": self.actuator_joint_names.index("index_joint"),
+            "middle": self.actuator_joint_names.index("middle_joint"),
+            "ring": self.actuator_joint_names.index("ring_joint"),
+            "pinky": self.actuator_joint_names.index("pinky_joint"),
+        }
+
+        mimic_joint_names = (
+            "thumb_joint3",
+            "thumb_joint4",
+            "index_dip",
+            "middle_dip",
+            "ring_dip",
+            "pinky_dip",
+        )
+        self._joint_ids = {
+            name: _required_id(self.model, mujoco.mjtObj.mjOBJ_JOINT, name)
+            for name in (*self.actuator_joint_names, *mimic_joint_names)
+        }
+        self._body_ids = {
+            "hand_root": _required_id(self.model, mujoco.mjtObj.mjOBJ_BODY, "hand_root"),
+            **{
+                finger: _required_id(self.model, mujoco.mjtObj.mjOBJ_BODY, body_name)
+                for finger, body_name in RH56E2_FINGER_BASES.items()
+            },
+        }
+        self._site_ids = {
+            finger: _required_id(self.model, mujoco.mjtObj.mjOBJ_SITE, site_name)
+            for finger, site_name in RH56E2_FINGER_TIPS.items()
+        }
+        self.apply_ctrl(self.open_ctrl)
+        self._thumb_lookup_ctrls, self._thumb_lookup_features = self._build_thumb_lookup()
+
+    def apply_ctrl(self, ctrl: np.ndarray | tuple[float, ...] | list[float]) -> np.ndarray:
+        clipped = np.clip(np.asarray(ctrl, dtype=float), self.ctrl_lower, self.ctrl_upper)
+        if clipped.shape != (self.model.nu,):
+            raise ValueError(f"Expected ctrl shape {(self.model.nu,)}, got {clipped.shape}")
+
+        self.data.ctrl[:] = clipped
+        self.data.qpos[:] = 0.0
+        for index, joint_name in enumerate(self.actuator_joint_names):
+            self._set_joint_qpos(joint_name, clipped[index])
+
+        thumb_pitch = clipped[self.thumb_pitch_index]
+        self._set_joint_qpos("thumb_joint3", 0.8024 * thumb_pitch)
+        self._set_joint_qpos("thumb_joint4", 0.76123688 * thumb_pitch)
+        for finger in NON_THUMB_FINGERS:
+            self._set_joint_qpos(f"{finger}_dip", 1.0843 * clipped[self.finger_ctrl_indices[finger]])
+
+        mujoco.mj_forward(self.model, self.data)
+        return clipped
+
+    def finger_features_for_ctrl(self, ctrl: np.ndarray) -> FingerFeatureSet:
+        self.apply_ctrl(ctrl)
+        hand_root = self.data.xpos[self._body_ids["hand_root"]]
+        index_base = self.data.xpos[self._body_ids["index"]]
+        middle_base = self.data.xpos[self._body_ids["middle"]]
+        pinky_base = self.data.xpos[self._body_ids["pinky"]]
+        basis = _build_basis(
+            lateral=index_base - pinky_base,
+            forward_seed=middle_base - hand_root,
+        )
+        if basis is None:
+            raise RuntimeError("RH56E2 hand frame is degenerate")
+
+        scale = _norm(index_base - pinky_base)
+        if scale <= 1e-8:
+            raise RuntimeError("RH56E2 hand scale is degenerate")
+
+        directions: dict[str, np.ndarray] = {}
+        distances: dict[str, float] = {}
+        for finger in FINGERS:
+            base = self.data.xpos[self._body_ids[finger]]
+            tip = self.data.site_xpos[self._site_ids[finger]]
+            vector = tip - base
+            direction = _normalize(basis.T @ vector)
+            if direction is None:
+                raise RuntimeError(f"RH56E2 {finger} feature is degenerate")
+            directions[finger] = direction
+            distances[finger] = _norm(vector) / scale
+        bends = {
+            "thumb": float(ctrl[self.thumb_pitch_index]),
+            "index": float(ctrl[self.finger_ctrl_indices["index"]]),
+            "middle": float(ctrl[self.finger_ctrl_indices["middle"]]),
+            "ring": float(ctrl[self.finger_ctrl_indices["ring"]]),
+            "pinky": float(ctrl[self.finger_ctrl_indices["pinky"]]),
+        }
+        return FingerFeatureSet(directions=directions, distances=distances, bends=bends)
+
+    def quest_bend_to_ctrl(self, target: FingerFeatureSet) -> np.ndarray:
+        ctrl = self.open_ctrl.copy()
+        thumb_ctrl = self.thumb_ctrl_guess(target)
+        ctrl[self.thumb_yaw_index] = thumb_ctrl[0]
+        ctrl[self.thumb_pitch_index] = thumb_ctrl[1]
+        for finger in NON_THUMB_FINGERS:
+            ctrl[self.finger_ctrl_indices[finger]] = target.bends[finger]
+        return np.clip(ctrl, self.ctrl_lower, self.ctrl_upper)
+
+    def retarget_target_features(self, target: FingerFeatureSet) -> FingerFeatureSet:
+        directions = dict(target.directions)
+        thumb_direction = _normalize(THUMB_DIRECTION_CALIBRATION @ target.directions["thumb"])
+        if thumb_direction is None:
+            thumb_direction = target.directions["thumb"]
+        directions["thumb"] = thumb_direction
+        for finger in NON_THUMB_FINGERS:
+            calibrated = _normalize(NON_THUMB_DIRECTION_CALIBRATION @ target.directions[finger])
+            if calibrated is not None:
+                directions[finger] = calibrated
+        bends = dict(target.bends)
+        bends["thumb"] = self.thumb_bend_to_pitch(target.bends["thumb"])
+        for finger in NON_THUMB_FINGERS:
+            bends[finger] = self.non_thumb_bend_to_ctrl(finger, target.bends[finger])
+        distances = dict(target.distances)
+        distances["thumb"] = self.projected_thumb_distance(
+            thumb_direction,
+            target.distances["thumb"],
+            bends["thumb"],
+        )
+        distances.update(self.projected_non_thumb_distances(bends))
+        return FingerFeatureSet(
+            directions=directions,
+            distances=distances,
+            bends=bends,
+        )
+
+    def thumb_ctrl_guess(self, target: FingerFeatureSet) -> tuple[float, float]:
+        target_pitch = float(
+            np.clip(
+                target.bends["thumb"],
+                self.ctrl_lower[self.thumb_pitch_index],
+                self.ctrl_upper[self.thumb_pitch_index],
+            )
+        )
+        index = self._thumb_lookup_index(
+            target.directions["thumb"],
+            target.distances["thumb"],
+            target_pitch,
+        )
+        yaw, pitch = self._thumb_lookup_ctrls[index]
+        return float(yaw), float(pitch)
+
+    def projected_thumb_distance(self, direction: np.ndarray, distance: float, pitch: float) -> float:
+        index = self._thumb_lookup_index(direction, distance, pitch)
+        yaw, pitch = self._thumb_lookup_ctrls[index]
+        ctrl = self.open_ctrl.copy()
+        ctrl[self.thumb_yaw_index] = yaw
+        ctrl[self.thumb_pitch_index] = pitch
+        features = self.finger_features_for_ctrl(ctrl)
+        return float(features.distances["thumb"])
+
+    def _thumb_lookup_index(self, target_direction: np.ndarray, target_distance: float, target_pitch: float) -> int:
+        direction_error = self._thumb_lookup_features["directions"] - target_direction
+        distance_error = self._thumb_lookup_features["distances"] - float(target_distance)
+        pitch_error = self._thumb_lookup_ctrls[:, 1] - target_pitch
+        residual = np.column_stack(
+            (
+                direction_error * THUMB_LOOKUP_DIRECTION_WEIGHT,
+                distance_error[:, None] * THUMB_LOOKUP_DISTANCE_WEIGHT,
+                pitch_error[:, None] * THUMB_LOOKUP_PITCH_WEIGHT,
+            )
+        )
+        return int(np.argmin(np.einsum("ij,ij->i", residual, residual)))
+
+    def thumb_bend_to_pitch(self, bend: float) -> float:
+        return float(
+            np.clip(
+                bend * THUMB_BEND_TO_PITCH_SCALE,
+                self.ctrl_lower[self.thumb_pitch_index],
+                self.ctrl_upper[self.thumb_pitch_index],
+            )
+        )
+
+    def non_thumb_bend_to_ctrl(self, finger: str, bend: float) -> float:
+        index = self.finger_ctrl_indices[finger]
+        return float(
+            np.clip(
+                bend * NON_THUMB_BEND_TO_CTRL_SCALE,
+                self.ctrl_lower[index],
+                self.ctrl_upper[index],
+            )
+        )
+
+    def projected_non_thumb_distances(self, bends: dict[str, float]) -> dict[str, float]:
+        ctrl = self.open_ctrl.copy()
+        for finger in NON_THUMB_FINGERS:
+            ctrl[self.finger_ctrl_indices[finger]] = bends[finger]
+        features = self.finger_features_for_ctrl(ctrl)
+        return {finger: float(features.distances[finger]) for finger in NON_THUMB_FINGERS}
+
+    def _build_thumb_lookup(self) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+        yaw_values = np.linspace(
+            self.ctrl_lower[self.thumb_yaw_index],
+            self.ctrl_upper[self.thumb_yaw_index],
+            THUMB_LOOKUP_YAW_SAMPLES,
+        )
+        pitch_values = np.linspace(
+            self.ctrl_lower[self.thumb_pitch_index],
+            self.ctrl_upper[self.thumb_pitch_index],
+            THUMB_LOOKUP_PITCH_SAMPLES,
+        )
+        ctrl_pairs: list[tuple[float, float]] = []
+        directions: list[np.ndarray] = []
+        distances: list[float] = []
+        bends: list[float] = []
+        for yaw in yaw_values:
+            for pitch in pitch_values:
+                ctrl = self.open_ctrl.copy()
+                ctrl[self.thumb_yaw_index] = yaw
+                ctrl[self.thumb_pitch_index] = pitch
+                features = self.finger_features_for_ctrl(ctrl)
+                ctrl_pairs.append((float(yaw), float(pitch)))
+                directions.append(features.directions["thumb"])
+                distances.append(features.distances["thumb"])
+                bends.append(features.bends["thumb"])
+        self.apply_ctrl(self.open_ctrl)
+        return (
+            np.asarray(ctrl_pairs, dtype=float),
+            {
+                "directions": np.asarray(directions, dtype=float),
+                "distances": np.asarray(distances, dtype=float),
+                "bends": np.asarray(bends, dtype=float),
+            },
+        )
+
+    def actuator_commands(self, ctrl: np.ndarray | tuple[float, ...]) -> tuple[ActuatorCommand, ...]:
+        return tuple(
+            ActuatorCommand(name=name, joint=joint, value=float(value))
+            for name, joint, value in zip(self.actuator_names, self.actuator_joint_names, ctrl)
+        )
+
+    def _set_joint_qpos(self, joint_name: str, value: float) -> None:
+        joint_id = self._joint_ids[joint_name]
+        address = int(self.model.jnt_qposadr[joint_id])
+        low, high = self.model.jnt_range[joint_id]
+        self.data.qpos[address] = float(np.clip(value, low, high))
+
+
+class Retargeter:
     def __init__(
         self,
-        adapter: DfqModelAdapter,
+        adapter: Any,
         hand: str,
         *,
         ema_alpha: float = DEFAULT_EMA_ALPHA,
@@ -509,7 +840,7 @@ class DfqRetargeter:
         self.feature_alpha = float(np.clip(feature_alpha, 0.0, 0.999))
         self.feature_deadband = max(0.0, float(feature_deadband))
         self._last_smoothed_ctrl: np.ndarray | None = None
-        self._last_successful_command: DfqCommand | None = None
+        self._last_successful_command: RetargetCommand | None = None
         self._last_filtered_features: FingerFeatureSet | None = None
 
     @property
@@ -518,7 +849,7 @@ class DfqRetargeter:
             return self.adapter.open_ctrl.copy()
         return self._last_smoothed_ctrl.copy()
 
-    def command_for_frame(self, frame: HandSkeletonFrame | None) -> DfqCommand:
+    def command_for_frame(self, frame: HandSkeletonFrame | None) -> RetargetCommand:
         if frame is None:
             return self._waiting_command(sequence=0, timestamp=time.time())
 
@@ -662,7 +993,7 @@ class DfqRetargeter:
             return float(current)
         return float(self.feature_alpha * previous + (1.0 - self.feature_alpha) * current)
 
-    def _waiting_command(self, *, sequence: int, timestamp: float) -> DfqCommand:
+    def _waiting_command(self, *, sequence: int, timestamp: float) -> RetargetCommand:
         return self._command(
             sequence=sequence,
             timestamp=timestamp,
@@ -679,12 +1010,13 @@ class DfqRetargeter:
         mode: str,
         ctrl: np.ndarray,
         loss: float | None,
-    ) -> DfqCommand:
+    ) -> RetargetCommand:
         ctrl_tuple = tuple(float(value) for value in ctrl)
-        return DfqCommand(
+        return RetargetCommand(
             sequence=int(sequence),
             timestamp=float(timestamp),
             hand=self.handedness,
+            backend=self.adapter.backend_name,
             model=self.adapter.model_name,
             mode=mode,
             ctrl=ctrl_tuple,
@@ -700,7 +1032,7 @@ class CommandWriter:
         self.destination = destination
         self.stream = stream or sys.stdout
 
-    def write(self, command: DfqCommand) -> None:
+    def write(self, command: RetargetCommand) -> None:
         if self.destination == "off":
             return
         print(json.dumps(command.to_payload(), separators=(",", ":")), file=self.stream, flush=True)
@@ -711,6 +1043,7 @@ class DfqRetargetRunner:
         self,
         state: SharedState,
         *,
+        retarget_model: str = "dfq",
         hand: str,
         model_path: str | Path | None,
         command_output: str,
@@ -725,9 +1058,10 @@ class DfqRetargetRunner:
         real_hand=None,
     ) -> None:
         self.state = state
-        self.model_path = Path(model_path) if model_path else default_dfq_model_path(hand)
-        self.adapter = DfqModelAdapter(self.model_path, hand)
-        self.retargeter = DfqRetargeter(
+        self.retarget_model = normalize_retarget_model(retarget_model)
+        self.model_path = Path(model_path) if model_path else default_model_path(self.retarget_model, hand)
+        self.adapter = create_model_adapter(self.retarget_model, self.model_path, hand)
+        self.retargeter = Retargeter(
             self.adapter,
             hand,
             ema_alpha=ema_alpha,
@@ -742,7 +1076,7 @@ class DfqRetargetRunner:
         self.live_log_interval = max(0.0, float(live_log_interval))
         self._last_processed_sequence: int | None = None
         self._last_live_log_at = time.monotonic()
-        self._last_command: DfqCommand | None = None
+        self._last_command: RetargetCommand | None = None
         self._last_command_ctrl: np.ndarray | None = None
         self._commands_since_log = 0
         self._max_ctrl_step_since_log = 0.0
@@ -754,7 +1088,7 @@ class DfqRetargetRunner:
         import mujoco.viewer
 
         print(
-            f"DFQ retarget: hand={self.retargeter.handedness} model={self.model_path}",
+            f"{self.retarget_model} retarget: hand={self.retargeter.handedness} model={self.model_path}",
             file=self.log_stream,
             flush=True,
         )
@@ -780,7 +1114,7 @@ class DfqRetargetRunner:
                 viewer.sync()
                 time.sleep(VIEWER_DT)
 
-    def _command_for_new_frame(self, frame: HandSkeletonFrame | None) -> DfqCommand | None:
+    def _command_for_new_frame(self, frame: HandSkeletonFrame | None) -> RetargetCommand | None:
         if frame is None:
             return None
         if frame.sequence == self._last_processed_sequence:
@@ -788,7 +1122,7 @@ class DfqRetargetRunner:
         self._last_processed_sequence = frame.sequence
         return self.retargeter.command_for_frame(frame)
 
-    def _record_live_command(self, command: DfqCommand) -> None:
+    def _record_live_command(self, command: RetargetCommand) -> None:
         ctrl = np.asarray(command.ctrl, dtype=float)
         if self._last_command_ctrl is not None:
             ctrl_step = float(np.linalg.norm(ctrl - self._last_command_ctrl))
@@ -816,7 +1150,7 @@ class DfqRetargetRunner:
         loss = "-" if command is None or command.loss is None else f"{command.loss:.3g}"
         ctrl = self.retargeter.current_ctrl
         print(
-            "[dfq-live] "
+            f"[{self.retarget_model}-live] "
             f"seq={frame_sequence} mode={mode} "
             f"peer={snapshot['peer_state']} channel={snapshot['channel_state']} "
             f"rx_fps={snapshot['rx_fps']:.1f} last_rx_age={last_rx_age} "
@@ -833,6 +1167,10 @@ class DfqRetargetRunner:
         self._max_ctrl_step_since_log = 0.0
         self._max_thumb_step_since_log = 0.0
         self._max_actuator_step_since_log = 0.0
+
+
+DfqRetargeter = Retargeter
+RetargetRunner = DfqRetargetRunner
 
 
 def _tracked_joint_position(joints: dict[str, Any], joint_name: str) -> np.ndarray | None:

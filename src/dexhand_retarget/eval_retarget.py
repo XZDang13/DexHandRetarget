@@ -11,19 +11,19 @@ from typing import Any, TextIO
 import numpy as np
 
 from .dfq_retarget import (
-    DfqModelAdapter,
-    DfqRetargeter,
     FINGERS,
     NON_THUMB_FINGERS,
+    Retargeter,
     canonical_handedness,
-    default_dfq_model_path,
+    create_model_adapter,
+    default_model_path,
     extract_quest_hand_features,
 )
 from .frames import HandSkeletonFrame
 from .replay import ReplayError, iter_replay_frames
 
 
-EVAL_REPORT_TYPE = "dfq_replay_eval"
+EVAL_REPORT_TYPE = "retarget_replay_eval"
 EVAL_REPORT_VERSION = 1
 DEFAULT_MAX_LAG_FRAMES = 12
 
@@ -36,6 +36,7 @@ class EvaluationError(ValueError):
 class EvaluationConfig:
     replay_path: Path
     hand: str
+    retarget_model: str = "dfq"
     model_path: Path | None = None
     ema_alpha: float = 0.45
     max_nfev: int = 25
@@ -156,7 +157,7 @@ def evaluate_replay(config: EvaluationConfig) -> dict[str, Any]:
         raise EvaluationError("--eval-max-frames must be greater than 0")
 
     replay_path = Path(config.replay_path)
-    model_path = Path(config.model_path) if config.model_path else default_dfq_model_path(config.hand)
+    model_path = Path(config.model_path) if config.model_path else default_model_path(config.retarget_model, config.hand)
     handedness = canonical_handedness(config.hand)
     frames = _load_frames(replay_path, config.max_frames)
     if not frames:
@@ -165,10 +166,10 @@ def evaluate_replay(config: EvaluationConfig) -> dict[str, Any]:
     coverage = _coverage_for_frames(frames, handedness)
     input_metrics = _input_metrics(frames, handedness)
 
-    prior_adapter = DfqModelAdapter(model_path, config.hand)
-    no_ema_adapter = DfqModelAdapter(model_path, config.hand)
-    configured_adapter = DfqModelAdapter(model_path, config.hand)
-    no_ema_retargeter = DfqRetargeter(
+    prior_adapter = create_model_adapter(config.retarget_model, model_path, config.hand)
+    no_ema_adapter = create_model_adapter(config.retarget_model, model_path, config.hand)
+    configured_adapter = create_model_adapter(config.retarget_model, model_path, config.hand)
+    no_ema_retargeter = Retargeter(
         no_ema_adapter,
         config.hand,
         ema_alpha=0.0,
@@ -178,7 +179,7 @@ def evaluate_replay(config: EvaluationConfig) -> dict[str, Any]:
         feature_alpha=0.0,
         feature_deadband=0.0,
     )
-    configured_retargeter = DfqRetargeter(
+    configured_retargeter = Retargeter(
         configured_adapter,
         config.hand,
         ema_alpha=config.ema_alpha,
@@ -290,6 +291,7 @@ def evaluate_replay(config: EvaluationConfig) -> dict[str, Any]:
             "duration_s": frames[-1].timestamp - frames[0].timestamp,
         },
         "method": {
+            "backend": config.retarget_model,
             "hand": handedness,
             "model_path": str(model_path),
             "ema_alpha": config.ema_alpha,
@@ -344,7 +346,8 @@ def print_summary(report: dict[str, Any], stream: TextIO | None = None) -> None:
     projection = report.get("projection_metrics", {})
     thumb_projection_gap = projection.get("thumb_raw_normalized_distance_projection_abs_gap", {})
 
-    print("Replay DFQ retarget evaluation", file=stream)
+    backend = report.get("method", {}).get("backend", "dfq")
+    print(f"Replay {backend} retarget evaluation", file=stream)
     print(f"  replay: {replay['path']}", file=stream)
     print(
         f"  frames: loaded={replay['frames_loaded']} sampled={replay['frames_sampled']} "
@@ -476,7 +479,7 @@ def _input_metrics(frames: list[HandSkeletonFrame], handedness: str) -> dict[str
 
 def _evaluate_ctrl(
     accumulator: MethodAccumulator,
-    adapter: DfqModelAdapter,
+    adapter: Any,
     target: Any,
     ctrl: np.ndarray,
     prior_ctrl: np.ndarray,
@@ -541,7 +544,7 @@ def _frame_detail(
     mode: str,
     raw_target: Any,
     retarget_target: Any,
-    adapter: DfqModelAdapter,
+    adapter: Any,
     ctrl: np.ndarray,
     prior_ctrl: np.ndarray,
     errors: dict[str, Any],
@@ -563,7 +566,7 @@ def _frame_detail(
             "prior_pitch": float(prior_ctrl[adapter.thumb_pitch_index]),
         },
         "ctrl": ctrl.tolist(),
-        "dfq_thumb": {
+        "model_thumb": {
             "direction": current.directions["thumb"].tolist(),
             "distance": current.distances["thumb"],
             "bend": current.bends["thumb"],

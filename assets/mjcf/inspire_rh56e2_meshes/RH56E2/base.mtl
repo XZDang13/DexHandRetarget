@@ -1,0 +1,50 @@
+# File produced by Open Asset Import Library (http://www.assimp.sf.net)
+# (assimp v5.3.0)
+
+newmtl white metal
+Kd 0.800000012 0.800000012 0.800000012
+Ke 0 0 0
+d 1
+Ns 250
+illum 2
+
+newmtl motor
+Kd 0.0500000007 0.0500000007 0.0500000007
+Ke 0 0 0
+d 1
+Ns 640
+illum 2
+
+newmtl rubber
+Kd 0.200000003 0.200000003 0.200000003
+Ke 0 0 0
+d 1
+illum 1
+
+newmtl black
+Kd 0 0 0
+Ke 0 0 0
+d 1
+Ns 250
+illum 2
+
+newmtl white
+Kd 0.800000012 0.800000012 0.800000012
+Ke 0 0 0
+d 1
+Ns 640
+illum 2
+
+newmtl light
+Kd 0 0.800274968 0.00121782371
+Ke 0 1 0.00397182442
+d 1
+Ns 250
+illum 2
+
+newmtl $Material_6
+Kd 1 1 1
+Ke 0 0 0
+d 1
+illum 1
+

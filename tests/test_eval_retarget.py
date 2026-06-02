@@ -161,10 +161,30 @@ class EvalReplayTests(unittest.TestCase):
 
             print_summary(report, stream=stream)
 
-        self.assertIn("Replay DFQ retarget evaluation", stream.getvalue())
+        self.assertIn("Replay dfq retarget evaluation", stream.getvalue())
         self.assertIn("thumb direction", stream.getvalue())
         self.assertIn("raw->projected thumb distance", stream.getvalue())
         self.assertIn("non-thumb direction", stream.getvalue())
+
+    def test_evaluate_replay_supports_rh56e2_backend(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            replay_path = Path(tmpdir) / "sample.jsonl"
+            write_replay(replay_path, [synthetic_frame(sequence=1)])
+
+            report = evaluate_replay(
+                EvaluationConfig(
+                    replay_path=replay_path,
+                    hand="right",
+                    retarget_model="rh56e2",
+                    ema_alpha=0.0,
+                    max_nfev=4,
+                )
+            )
+
+        self.assertEqual(report["method"]["backend"], "rh56e2")
+        self.assertEqual(report["type"], EVAL_REPORT_TYPE)
+        self.assertEqual(report["coverage"]["valid_feature_frames"], 1)
+        self.assertIn("model_thumb", report["per_frame"][0])
 
     def test_eval_cli_args_parse(self) -> None:
         args = build_parser().parse_args(

@@ -30,6 +30,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Retarget one Quest hand to the Inspire DFQ MuJoCo model.",
     )
     parser.add_argument(
+        "--retarget-model",
+        choices=("dfq", "rh56e2"),
+        help="Retarget one Quest hand to the selected MuJoCo hand model.",
+    )
+    parser.add_argument(
         "--real",
         action="store_true",
         help="Connect to a real Inspire hand and send commands to it.",
@@ -38,24 +43,29 @@ def build_parser() -> argparse.ArgumentParser:
         "--hand",
         choices=("left", "right"),
         default="right",
-        help="Selected hand for --retarget-dfq.",
+        help="Selected hand for retargeting.",
+    )
+    parser.add_argument(
+        "--model-path",
+        type=Path,
+        help="Override the selected retarget model path.",
     )
     parser.add_argument(
         "--dfq-model-path",
         type=Path,
-        help="Override the Inspire DFQ MJCF model path.",
+        help="Override the Inspire DFQ MJCF model path. Alias for --model-path with --retarget-model dfq.",
     )
     parser.add_argument(
         "--command-output",
         choices=("stdout", "off"),
         default="stdout",
-        help="Where to emit DFQ actuator commands in --retarget-dfq mode.",
+        help="Where to emit retarget actuator commands.",
     )
     parser.add_argument(
         "--retarget-alpha",
         type=float,
         default=0.45,
-        help="EMA smoothing alpha for DFQ commands. Lower values reduce latency.",
+        help="EMA smoothing alpha for retarget commands. Lower values reduce latency.",
     )
     parser.add_argument(
         "--retarget-max-nfev",
@@ -91,7 +101,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--live-log-interval",
         type=float,
         default=0.0,
-        help="Print live DFQ retarget diagnostics every N seconds. Use 0 to disable.",
+        help="Print live retarget diagnostics every N seconds. Use 0 to disable.",
     )
     parser.add_argument(
         "--save-replay",
@@ -130,7 +140,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--eval-replay",
         type=Path,
         metavar="PATH",
-        help="Evaluate a saved replay against the DFQ retargeter and exit.",
+        help="Evaluate a saved replay against the selected retargeter and exit.",
     )
     parser.add_argument(
         "--eval-output",
@@ -157,8 +167,39 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def configure_retarget_args(args: argparse.Namespace) -> str | None:
+    if args.retarget_dfq:
+        if args.retarget_model == "rh56e2":
+            return "--retarget-dfq cannot be combined with --retarget-model rh56e2"
+        args.retarget_model = "dfq"
+
+    if args.eval_replay is not None and args.retarget_model is None:
+        args.retarget_model = "dfq"
+
+    if args.model_path is not None and args.dfq_model_path is not None and args.model_path != args.dfq_model_path:
+        return "--model-path and --dfq-model-path refer to different files"
+
+    if args.dfq_model_path is not None:
+        if args.retarget_model == "rh56e2":
+            return "--dfq-model-path can only be used with --retarget-model dfq"
+        args.model_path = args.dfq_model_path
+
+    if args.real and args.retarget_model == "rh56e2":
+        return "--real is only supported with --retarget-model dfq"
+
+    return None
+
+
+def retarget_enabled(args: argparse.Namespace) -> bool:
+    return args.retarget_model is not None
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    retarget_error = configure_retarget_args(args)
+    if retarget_error is not None:
+        print(retarget_error, file=sys.stderr)
+        return 2
     args.port = args.port or (8443 if args.https else 8080)
 
     if args.save_replay is not None and args.replay is not None:
@@ -171,7 +212,7 @@ def main(argv: list[str] | None = None) -> int:
         print("--eval-replay cannot be used together with --save-replay or --replay", file=sys.stderr)
         return 2
 
-    log_stream = sys.stderr if args.retarget_dfq and args.command_output == "stdout" else sys.stdout
+    log_stream = sys.stderr if retarget_enabled(args) and args.command_output == "stdout" else sys.stdout
 
     if args.eval_replay is not None:
         return run_eval_replay(args, log_stream)
@@ -331,7 +372,7 @@ def run_headless_replay(args: argparse.Namespace, log_stream: TextIO) -> int:
         print(f"Import error: {exc}", file=sys.stderr)
         return 1
 
-    if not args.retarget_dfq:
+    if not retarget_enabled(args):
         count = 0
         try:
             for _frame in iter_replay_frames(args.replay):
@@ -349,9 +390,9 @@ def run_headless_replay(args: argparse.Namespace, log_stream: TextIO) -> int:
     try:
         from .dfq_retarget import (
             CommandWriter,
-            DfqModelAdapter,
-            DfqRetargeter,
-            default_dfq_model_path,
+            Retargeter,
+            create_model_adapter,
+            default_model_path,
         )
     except ImportError as exc:
         print(
@@ -361,10 +402,10 @@ def run_headless_replay(args: argparse.Namespace, log_stream: TextIO) -> int:
         print(f"Import error: {exc}", file=sys.stderr)
         return 1
 
-    model_path = args.dfq_model_path or default_dfq_model_path(args.hand)
+    model_path = args.model_path or default_model_path(args.retarget_model, args.hand)
     try:
-        adapter = DfqModelAdapter(model_path, args.hand)
-        retargeter = DfqRetargeter(
+        adapter = create_model_adapter(args.retarget_model, model_path, args.hand)
+        retargeter = Retargeter(
             adapter,
             args.hand,
             ema_alpha=args.retarget_alpha,
@@ -375,12 +416,12 @@ def run_headless_replay(args: argparse.Namespace, log_stream: TextIO) -> int:
             feature_deadband=args.retarget_feature_deadband,
         )
     except Exception as exc:
-        print(f"Failed to initialize DFQ retargeter: {exc}", file=sys.stderr)
+        print(f"Failed to initialize {args.retarget_model} retargeter: {exc}", file=sys.stderr)
         return 1
 
     writer = CommandWriter(args.command_output)
     print(
-        f"[replay] Retargeting replay from {args.replay} with model={model_path}",
+        f"[replay] Retargeting replay from {args.replay} with backend={args.retarget_model} model={model_path}",
         file=log_stream,
         flush=True,
     )
@@ -418,8 +459,9 @@ def run_eval_replay(args: argparse.Namespace, log_stream: TextIO) -> int:
 
     config = EvaluationConfig(
         replay_path=args.eval_replay,
+        retarget_model=args.retarget_model,
         hand=args.hand,
-        model_path=args.dfq_model_path,
+        model_path=args.model_path,
         ema_alpha=args.retarget_alpha,
         max_nfev=args.retarget_max_nfev,
         max_ctrl_step=args.retarget_max_step,
@@ -443,8 +485,8 @@ def run_eval_replay(args: argparse.Namespace, log_stream: TextIO) -> int:
 
 
 def show_viewer(args: argparse.Namespace, state: SharedState, log_stream: TextIO) -> None:
-    if args.retarget_dfq:
-        from .dfq_retarget import DfqRetargetRunner
+    if retarget_enabled(args):
+        from .dfq_retarget import RetargetRunner
 
         real_hand = None
 
@@ -453,10 +495,11 @@ def show_viewer(args: argparse.Namespace, state: SharedState, log_stream: TextIO
 
             real_hand = RealInspireHand()
 
-        runner = DfqRetargetRunner(
+        runner = RetargetRunner(
             state,
+            retarget_model=args.retarget_model,
             hand=args.hand,
-            model_path=args.dfq_model_path,
+            model_path=args.model_path,
             command_output=args.command_output,
             ema_alpha=args.retarget_alpha,
             max_nfev=args.retarget_max_nfev,

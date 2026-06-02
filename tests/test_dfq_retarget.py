@@ -12,15 +12,20 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from dexhand_retarget.cli import build_parser  # noqa: E402
+from dexhand_retarget.cli import build_parser, configure_retarget_args  # noqa: E402
 from dexhand_retarget.dfq_retarget import (  # noqa: E402
     CommandWriter,
     DfqModelAdapter,
     DfqRetargeter,
+    Retargeter,
+    Rh56e2ModelAdapter,
     default_dfq_model_path,
+    default_model_path,
+    default_rh56e2_model_path,
     extract_quest_hand_features,
 )
 from dexhand_retarget.frames import HandSkeleton, HandSkeletonFrame, JointPose, XR_HAND_JOINT_IDS  # noqa: E402
+from scripts.import_rh56e2_assets import quat_from_urdf_rpy  # noqa: E402
 
 
 def synthetic_frame(
@@ -188,6 +193,93 @@ class DfqModelAdapterTests(unittest.TestCase):
             self.assertGreater(calibrated.distances[finger], 0.0)
 
 
+class Rh56e2ModelAdapterTests(unittest.TestCase):
+    def test_rh56e2_assets_use_urdf_rpy_quaternions(self) -> None:
+        model_xml = default_rh56e2_model_path("right").read_text(encoding="utf-8")
+
+        self.assertIn("quat=", model_xml)
+        self.assertNotIn("euler=", model_xml)
+
+    def test_urdf_rpy_quaternion_conversion_matches_fixed_axis_rpy(self) -> None:
+        rpy = (1.6057, 0.0, -1.5708)
+
+        np.testing.assert_allclose(
+            quat_to_matrix(quat_from_urdf_rpy(rpy)),
+            urdf_rpy_to_matrix(rpy),
+            atol=1e-12,
+        )
+
+    def test_loads_left_and_right_rh56e2_models(self) -> None:
+        expected_joints = (
+            "thumb_joint1",
+            "thumb_joint2",
+            "index_joint",
+            "middle_joint",
+            "ring_joint",
+            "pinky_joint",
+        )
+        for side in ("left", "right"):
+            adapter = Rh56e2ModelAdapter(default_rh56e2_model_path(side), side)
+
+            self.assertEqual(adapter.model.nu, 6)
+            self.assertEqual(adapter.actuator_joint_names, expected_joints)
+            self.assertEqual(len(adapter.actuator_names), 6)
+            self.assertEqual(len(adapter.ctrl_ranges), 6)
+            self.assertTrue(np.all(adapter.open_ctrl >= adapter.ctrl_lower))
+            self.assertTrue(np.all(adapter.open_ctrl <= adapter.ctrl_upper))
+            features = adapter.finger_features_for_ctrl(adapter.open_ctrl)
+            self.assertEqual(set(features.directions), {"thumb", "index", "middle", "ring", "pinky"})
+            self.assertTrue(all(math.isfinite(value) for value in features.distances.values()))
+
+    def test_rh56e2_ik_returns_bounded_command(self) -> None:
+        adapter = Rh56e2ModelAdapter(default_rh56e2_model_path("right"), "right")
+        retargeter = Retargeter(adapter, "right", max_nfev=8)
+
+        command = retargeter.command_for_frame(synthetic_frame(sequence=5))
+
+        self.assertEqual(command.mode, "tracking")
+        self.assertEqual(command.backend, "rh56e2")
+        self.assertEqual(command.sequence, 5)
+        self.assertEqual(len(command.ctrl), 6)
+        self.assertEqual([item.joint for item in command.actuators], list(adapter.actuator_joint_names))
+        ctrl = np.asarray(command.ctrl)
+        self.assertTrue(np.all(ctrl >= adapter.ctrl_lower - 1e-9))
+        self.assertTrue(np.all(ctrl <= adapter.ctrl_upper + 1e-9))
+
+    def test_curled_quest_fingers_drive_rh56e2_non_thumb_controls(self) -> None:
+        adapter = Rh56e2ModelAdapter(default_rh56e2_model_path("right"), "right")
+        retargeter = Retargeter(adapter, "right", ema_alpha=0.0, max_nfev=20, max_ctrl_step=0.0)
+
+        command = retargeter.command_for_frame(curled_frame(sequence=7))
+
+        self.assertEqual(command.mode, "tracking")
+        ctrl = np.asarray(command.ctrl)
+        self.assertGreater(float(ctrl[2:].sum()), 0.2)
+
+    def test_thumb_opposition_affects_rh56e2_thumb_controls(self) -> None:
+        adapter = Rh56e2ModelAdapter(default_rh56e2_model_path("right"), "right")
+        retargeter = Retargeter(adapter, "right", ema_alpha=0.0, max_nfev=20, max_ctrl_step=0.0)
+
+        neutral = retargeter.command_for_frame(synthetic_frame(sequence=8))
+        opposed = retargeter.command_for_frame(thumb_opposition_frame(sequence=9, z_offset=-0.1))
+
+        thumb_delta = np.asarray(opposed.ctrl[:2]) - np.asarray(neutral.ctrl[:2])
+        self.assertGreater(float(np.linalg.norm(thumb_delta)), 0.01)
+
+    def test_rh56e2_hold_and_waiting_modes(self) -> None:
+        adapter = Rh56e2ModelAdapter(default_rh56e2_model_path("right"), "right")
+        retargeter = Retargeter(adapter, "right", max_nfev=8)
+
+        waiting = retargeter.command_for_frame(synthetic_frame(sequence=1, tracked=False))
+        tracking = retargeter.command_for_frame(synthetic_frame(sequence=2))
+        hold = retargeter.command_for_frame(synthetic_frame(sequence=3, tracked=False))
+
+        self.assertEqual(waiting.mode, "waiting")
+        self.assertEqual(waiting.ctrl, tuple(float(value) for value in adapter.open_ctrl))
+        self.assertEqual(hold.mode, "hold")
+        self.assertEqual(hold.ctrl, tracking.ctrl)
+
+
 class DfqRetargeterTests(unittest.TestCase):
     def test_ik_returns_bounded_command(self) -> None:
         adapter = DfqModelAdapter(default_dfq_model_path("right"), "right")
@@ -312,10 +404,11 @@ class CommandWriterTests(unittest.TestCase):
         CommandWriter("stdout", stream).write(command)
 
         payload = json.loads(stream.getvalue())
-        self.assertEqual(payload["type"], "dfq_command")
+        self.assertEqual(payload["type"], "retarget_command")
         self.assertEqual(payload["version"], 1)
         self.assertEqual(payload["mode"], "tracking")
         self.assertEqual(payload["hand"], "Right")
+        self.assertEqual(payload["backend"], "dfq")
         self.assertEqual(len(payload["ctrl"]), 6)
         self.assertEqual([item["name"] for item in payload["actuators"]], list(adapter.actuator_names))
 
@@ -342,7 +435,9 @@ class CliParserTests(unittest.TestCase):
             ]
         )
 
+        self.assertIsNone(configure_retarget_args(args))
         self.assertTrue(args.retarget_dfq)
+        self.assertEqual(args.retarget_model, "dfq")
         self.assertEqual(args.hand, "right")
         self.assertEqual(args.command_output, "stdout")
         self.assertEqual(args.live_log_interval, 1.5)
@@ -350,6 +445,62 @@ class CliParserTests(unittest.TestCase):
         self.assertEqual(args.retarget_release_max_step, 0.06)
         self.assertEqual(args.retarget_feature_alpha, 0.4)
         self.assertEqual(args.retarget_feature_deadband, 0.02)
+
+    def test_retarget_model_rh56e2_args_parse(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "--retarget-model",
+                "rh56e2",
+                "--hand",
+                "left",
+                "--model-path",
+                "custom.xml",
+            ]
+        )
+
+        self.assertIsNone(configure_retarget_args(args))
+        self.assertFalse(args.retarget_dfq)
+        self.assertEqual(args.retarget_model, "rh56e2")
+        self.assertEqual(args.hand, "left")
+        self.assertEqual(args.model_path, Path("custom.xml"))
+
+    def test_conflicting_legacy_dfq_alias_is_rejected(self) -> None:
+        args = build_parser().parse_args(["--retarget-dfq", "--retarget-model", "rh56e2"])
+
+        self.assertEqual(
+            configure_retarget_args(args),
+            "--retarget-dfq cannot be combined with --retarget-model rh56e2",
+        )
+
+    def test_real_rh56e2_is_rejected(self) -> None:
+        args = build_parser().parse_args(["--retarget-model", "rh56e2", "--real"])
+
+        self.assertEqual(configure_retarget_args(args), "--real is only supported with --retarget-model dfq")
+
+    def test_default_model_path_selects_rh56e2_side(self) -> None:
+        self.assertEqual(default_model_path("rh56e2", "left"), default_rh56e2_model_path("left"))
+
+
+def urdf_rpy_to_matrix(rpy: tuple[float, float, float]) -> np.ndarray:
+    roll, pitch, yaw = rpy
+    cr, sr = math.cos(roll), math.sin(roll)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    rx = np.asarray(((1.0, 0.0, 0.0), (0.0, cr, -sr), (0.0, sr, cr)))
+    ry = np.asarray(((cp, 0.0, sp), (0.0, 1.0, 0.0), (-sp, 0.0, cp)))
+    rz = np.asarray(((cy, -sy, 0.0), (sy, cy, 0.0), (0.0, 0.0, 1.0)))
+    return rz @ ry @ rx
+
+
+def quat_to_matrix(quat: tuple[float, float, float, float]) -> np.ndarray:
+    w, x, y, z = quat
+    return np.asarray(
+        (
+            (1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)),
+            (2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)),
+            (2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)),
+        )
+    )
 
 
 if __name__ == "__main__":
